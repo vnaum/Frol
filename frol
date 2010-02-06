@@ -1,0 +1,424 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+use LWP;
+use HTTP::Request::Common qw(POST);
+use Net::Netrc;
+
+my $verbose=1;
+my $debug=0;
+my $delete=1;
+my $format="6";      # txt
+my $language="0,1";  # en/ru
+my $username=undef;
+my $password=undef;
+
+my $logged_in = 0;
+my $ua = undef;
+
+sub verb_log($);
+sub debug_save($$);
+sub login();
+sub upload($);
+sub recognize(@);
+sub wait_result($);
+sub save_result();
+sub delete_result($);
+sub ocr(@);
+
+# TODO:
+# docs
+# bitbucket?
+#
+# main
+{
+  my $help = 0;
+  my $result = GetOptions (
+    "username|u=s" => \$username,
+    "password|p=s" => \$password,
+    "format|f=s" =>   \$format,
+    "language|lang|l=s" =>   \$language,
+    "debug|d"      => \$debug,
+    "verbose|v"    => \$verbose,
+    'help|?'       => \$help,
+  );
+  pod2usage(1) if $help;
+
+  unless ($username and $password)
+  {
+    if (my $mach = Net::Netrc->lookup('abbyyonline.com'))
+    {
+      ($username, $password, undef) = $mach->lpa;
+    }
+  }
+
+  unless ($username and $password)
+  {
+    die "No username/password provided.\nEither use --username and --password or add abbyyonline.com entry to your ~/.netrc\n";
+  }
+
+  $ua = LWP::UserAgent->new(
+    requests_redirectable => ['GET', 'HEAD', 'POST'],
+    cookie_jar => {},
+  );
+
+  my @lng = split ',', $language;
+  $language = \@lng;
+
+  my %formats = qw(
+    doc  1
+    xls  2
+    pdf  3
+    rtf  5
+    txt  6
+  );
+
+  $format = $formats{$format} if $formats{$format};
+
+  pod2usage(1) unless @ARGV;
+  ocr(@ARGV);
+}
+
+sub verb_log($)
+{
+  my ($msg) = @_;
+  print STDERR "$msg\n" if ($verbose);
+}
+
+sub debug_save($$)
+{
+  my ($fn, $data) = @_;
+  return unless $debug;
+  open F, '>', $fn or die;
+  print F $data;
+  close F;
+}
+
+sub login()
+{
+  verb_log("Logging in as $username...");
+
+  my $req = POST ( 'http://www.abbyyonline.com/en/Account/LogOn',
+    [
+      'username'        => $username,
+      'password'        => $password,
+      'rememberMe'      => 'false',
+      'service'         => '',
+      'back'            => '',
+    ]
+  );
+
+  # print $req->content();
+
+  # Pass request to the user agent and get a response back
+  my $res = $ua->request($req);
+
+  debug_save('dbg_login.html', $res->content);
+  # Check the outcome of the response
+  if ($res->is_error)
+  {
+    die "Login failed: " . $res->status_line . "\n";
+  }
+  $logged_in = 1;
+}
+
+sub upload($)
+{
+  my ($in_file) = @_;
+
+  # lets first check files that already are there
+  # (to find new ones)
+  my %files_seen = ();
+  {
+    my $res = $ua->get("http://finereader.abbyyonline.com/en/Task/Queue");
+    my $cnt = $res->content();
+    while ($cnt =~ m/<div class="frol-uploaded-file" id="file([^"]+?)">/ig)
+    {
+      $files_seen{$1} = 1;
+    }
+  }
+
+  verb_log("Uploading $in_file...");
+
+  my $req = POST ( 'http://finereader.abbyyonline.com/en/Task/Queue',
+    Content_Type => 'form-data',
+    Content => [
+      'fileName'        => $in_file,
+      'userFileName'    => $in_file,
+      'theFile'         => [ $in_file ],
+      'isSendMailWithResult' => 'false',
+      'upload'          => 'Upload',
+      'languageIds'     => ['0', '1'],  # en + ru
+      'formatId'        => '6',    # txt
+    ]
+  );
+
+  # print $req->content();
+
+  # Pass request to the user agent and get a response back
+  my $res = $ua->request($req);
+
+  debug_save('dbg_upload.html', $res->content);
+  # Check the outcome of the response
+  if ($res->is_error)
+  {
+    die "Upload failed: " . $res->status_line . "\n";
+  }
+
+  # now lets find this file in the list:
+  my $fid = undef;
+  my $cnt = $res->content;
+  while ($cnt =~ m/<div class="frol-uploaded-file" id="file([^"]+?)">/ig)
+  {
+    next if $files_seen{$1};
+    $fid = $1;
+  }
+  die "Can't find uploaded file in the list!\n" if not $fid;
+
+  verb_log("Uploaded as $fid");
+  return $fid;
+}
+
+sub recognize(@)
+{
+  my (@fids) = @_;
+  my $num_pages = scalar(@fids);
+  verb_log("Recognizing $num_pages pages...");
+  verb_log("  Ids: " . join(', ', @fids));
+
+  my $req = POST ( 'http://finereader.abbyyonline.com/en/Task/Queue',
+    Content => [
+      'isSendMailWithResult' => 'false',
+      'fileIds'         => \@fids,
+      'languageIds'     => $language,
+      'formatId'        => $format,
+    ]
+  );
+
+  my $res = $ua->request($req);
+
+  debug_save('dbg_recognize.html', $res->content);
+  # Check the outcome of the response
+  if ($res->is_error)
+  {
+    die "Recognizion failed: " . $res->status_line . "\n";
+  }
+
+  return $res->content();
+}
+
+sub wait_result($)
+{
+  my ($eta_page) = @_;
+  # ignored for now
+
+  verb_log("Waiting for result...");
+
+  my $delay = 30;
+  my $pages_left = "(unknown)";
+  while ($pages_left)
+  {
+    verb_log("  $pages_left pages left, sleeping for $delay seconds...");
+    sleep $delay;
+    $delay = 10; # sleep less aster initial sleep
+
+    my $res = $ua->get("http://finereader.abbyyonline.com/en/Account/Setting");
+    $pages_left = $1 if $res->content() =~ m(<th>Pages in progress:</th>\s*<td>(\d+)</td>)is;
+  }
+}
+
+sub save_result()
+{
+  verb_log("Fetching results list...");
+  my $res = $ua->get("http://finereader.abbyyonline.com/en/Account/Setting");
+  debug_save('dbg_save.html', $res->content);
+  # Check the outcome of the response
+  if ($res->is_error)
+  {
+    die "Result download failed: " . $res->status_line . "\n";
+  }
+
+  my $pg = $res->content();
+  while ($pg =~ m(href="(/Task/Result/([^"]+))")g)
+  {
+    my ($ref, $code) = ($1, $2);
+    verb_log("Fetching result $ref...");
+
+    my $res = $ua->get("http://finereader.abbyyonline.com" . $ref);
+    # Check the outcome of the response
+    if ($res->is_error)
+    {
+      die "Result download for $ref failed: " . $res->status_line . "\n";
+    }
+
+    my $fname = "$code.txt";
+    if ($res->header('content-disposition') =~ m/filename="(.*?)"/)
+    {
+      $fname = $1;
+    }
+
+    open F, '>', $fname or die "Can't open $fname: $!";
+    print F $res->content();
+    close F;
+    verb_log("...saved as $fname");
+
+    if ($delete)
+    {
+      delete_result($code);
+    }
+  }
+
+  my $pages_available = "(unknown)";
+  $pages_available = $1 if $res->content() =~ m(<th>Pages available:</th>\s*<td>(\d+)</td>)is;
+  verb_log("Pages available: $pages_available");
+}
+
+sub delete_result($)
+{
+  my ($code) = @_;
+  verb_log("Deleting $code...");
+
+  my $res = $ua->get("http://finereader.abbyyonline.com/en/Task/RemoveTaskResult/" . lc($code));
+  # Check the outcome of the response
+  if ($res->is_error)
+  {
+    warn "Deleting $code failed: " . $res->status_line . "\n";
+  }
+  else
+  {
+    verb_log("Done.");
+  }
+}
+
+sub ocr(@)
+{
+  my (@files) = @_;
+
+  # basic check
+  for my $f (@files)
+  {
+    unless (-r $f and -f $f)
+    {
+      die "$f is missing or unreadable\n";
+    }
+    if ( -s $f > 10*1024*1024)
+    {
+      die "$f is too large (size>10Mb)\n";
+    }
+  }
+
+  my @fids = ();
+  for my $f (@files)
+  {
+    login() if not $logged_in;
+    push @fids, upload($f);
+  }
+
+  my $eta = recognize(@fids);
+  wait_result($eta);
+  save_result();
+}
+
+
+=head1 NAME
+
+frol - http://finereader.abbyyonline.com command-line client
+
+=head1 SYNOPSIS
+
+frol [options] [file ...]
+
+ Options:
+   -h, --help            brief help message
+   -f, --format          output format
+   -l, --lang            OCR languages
+   -u, --username        service username (can be read from ~/.netrc)
+   -p, --password        service password (can be read from ~/.netrc)
+   -d, --debug           save service responses in current directory
+
+=head1 DESCRIPTION
+
+This program submits given input file(s) to http://finereader.abbyyonline.com
+and then fetches back recognized files. Of course, you will need to register and activate
+your account at http://www.abbyyonline.com/en/Account/Register.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-f, --format>
+
+Specify output format. You can specify either number (1-6) or file extension.
+Default format is 6 (UTF-8 text).
+
+Full list:
+        1       MS Word Document (*.doc)
+        2       MS Excel Worksheet (*.xls)
+        3       PDF Document (*.pdf)
+        4       PDF/A Document (*.pdf)
+        5       RTF Document (*.rtf)
+        6       Plain text (*.txt)
+
+=item B<-l, --language>
+
+Specify document languages, as a comma-separated list. Default is 0,1 (english/russian).
+
+Full list:
+
+        17	    Abkhaz
+        18	    Armenian (Eastern)
+        19	    Armenian (Grabar)
+        20	    Armenian (Western)
+        21	    Bashkir
+        22	    Bulgarian
+        23	    Catalan
+        24	    Croatian
+        12	    Czech
+        25	    Danish
+        26	    Dutch (Belgium)
+        10	    Dutch (Netherlands)
+        0	    English
+        27	    Estonian
+        28	    Finnish
+        3	    French
+        2	    German
+        29	    German (new spelling)
+        30	    Greek
+        11	    Hungarian
+        7	    Italian
+        32	    Latvian
+        15	    Lithuanian
+        33	    Norwegian (Bokmal)
+        34	    Norwegian (Nynorsk)
+        9	    Polish
+        35	    Portuguese (Brazilian)
+        8	    Portuguese (Portugal)
+        36	    Romanian
+        1	    Russian
+        13	    Slovak
+        37	    Slovenian
+        4	    Spanish
+        14	    Swedish
+        38	    Tatar
+        16	    Turkish
+        5	    Ukrainian
+
+=back
+
+=head1 FILES
+
+abbyyonline.com entry in ~/.netrc can be used to specify login and password.
+Sample line:
+
+  machine abbyyonline.com login user@somewhere.com password topsecret
+
+=cut
+
