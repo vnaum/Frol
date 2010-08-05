@@ -226,7 +226,7 @@ sub wait_result($)
     sleep $delay;
     $delay = 10; # sleep less aster initial sleep
 
-    my $res = $ua->get("http://finereader.abbyyonline.com/en/Account/Setting");
+    my $res = $ua->get("http://finereader.abbyyonline.com/en/Task/History/");
     $pages_left = $1 if $res->content() =~ m(<th>Pages in progress:</th>\s*<td>(\d+)</td>)is;
   }
 }
@@ -234,7 +234,7 @@ sub wait_result($)
 sub save_result()
 {
   verb_log("Fetching results list...");
-  my $res = $ua->get("http://finereader.abbyyonline.com/en/Account/Setting");
+  my $res = $ua->get("http://finereader.abbyyonline.com/en/Task/History/");
   debug_save('dbg_save.html', $res->content);
   # Check the outcome of the response
   if ($res->is_error)
@@ -243,7 +243,7 @@ sub save_result()
   }
 
   my $pg = $res->content();
-  while ($pg =~ m(href="(/Task/Result/([^"]+))")g)
+  while ($pg =~ m(href="(/en/Task/Result/([^"]+))")g)
   {
     my ($ref, $code) = ($1, $2);
     verb_log("Fetching result $ref...");
